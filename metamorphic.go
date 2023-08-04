@@ -25,6 +25,7 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,7 +67,7 @@ func Generate[I any](rng *rand.Rand, n int, fn func(*rand.Rand) func(*rand.Rand)
 }
 
 // RunOne runs the provided operations, using the provided initial state.
-func RunOne[S any](t *testing.T, initial S, ops []Op[S]) {
+func RunOne[S any](t testing.TB, initial S, ops []Op[S]) {
 	l := &Logger{t: t}
 
 	// TODO(jackson): Support teeing to additional sink(s), eg, a file.
@@ -99,6 +100,56 @@ func RunOne[S any](t *testing.T, initial S, ops []Op[S]) {
 	if t.Failed() {
 		t.Logf("History:\n\n%s", l.history.String())
 	}
+}
+
+// RunInTandem takes n initial states and runs the provided set of operations
+// against each incrementally. It fails the test as soon as any of the logs
+// diverge.
+func RunInTandem[S any](t testing.TB, initial []S, ops []Op[S]) []*Logger {
+	logs := make([]*Logger, len(initial))
+	logOpOffsets := make([][]int, len(initial))
+	for i := 0; i < len(logs); i++ {
+		logs[i] = &Logger{t: t}
+		logs[i].w = &logs[i].history
+		logs[i].wIndent = newlineIndentingWriter{Writer: logs[i].w, indent: []byte("  ")}
+		logOpOffsets[i] = make([]int, len(ops))
+	}
+
+	s := initial
+	for i := 0; i < len(ops); i++ {
+		for j, l := range logs {
+			func() {
+				// Ensure panics result in printing the history.
+				defer func() {
+					if r := recover(); r != nil {
+						l.Fatal(r)
+					}
+				}()
+
+				// Set Logger's per-Op context.
+				l.opNumber = i
+				l.op = ops[i]
+				l.logged = false
+				logOpOffsets[j][i] = l.history.Len()
+				fmt.Fprintf(l, "op %6d: %s = ", l.opNumber, l.op)
+				ops[i].Run(l, s[j])
+
+				if !l.logged {
+					fmt.Fprint(l, "-")
+				}
+				fmt.Fprintln(l)
+			}()
+			if t.Failed() {
+				t.Logf("Aborting; History:\n\n%s", l.history.String())
+			}
+			if j > 0 {
+				if err := compareOpResults(logs[0], logOpOffsets[0][i], logs[j], logOpOffsets[j][i]); err != nil {
+					t.Errorf("state %d and %d diverged at op %d:\n%s", 0, j, i, err)
+				}
+			}
+		}
+	}
+	return logs
 }
 
 // Op represents a single operation within a metamorphic test.
@@ -185,6 +236,20 @@ func (l *Logger) Write(b []byte) (int, error) {
 		l.lastByte = b[n-1]
 	}
 	return n, err
+}
+
+// History returns the history accumulated by the Logger.
+func (l *Logger) History() string {
+	return l.history.String()
+}
+
+func compareOpResults(a *Logger, offA int, b *Logger, offB int) error {
+	aResult := a.history.Bytes()[offA:]
+	bResult := b.history.Bytes()[offB:]
+	if !bytes.Equal(aResult, bResult) {
+		return errors.Newf("divergence:\n%s\n%s\n", aResult, bResult)
+	}
+	return nil
 }
 
 // newlineIndentingWriter wraps a Writer. Whenever a '\n' is written, the
