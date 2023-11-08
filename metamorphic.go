@@ -22,58 +22,34 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"math/rand"
 	"testing"
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
-// ItemWeight holds an item and its corresponding weight.
-type ItemWeight[I any] struct {
-	Item   I
-	Weight int
-}
-
-// Weighted takes a slice of items and their weights, producing a function that
-// randomly picks items from the slice using the distribution indicated by the
-// weights.
-func Weighted[I any](items []ItemWeight[I]) func(rng *rand.Rand) I {
-	var total int
-	for i := 0; i < len(items); i++ {
-		total += items[i].Weight
-	}
-	return func(rng *rand.Rand) I {
-		w := rng.Intn(total)
-		for i := 0; i < len(items); i++ {
-			w -= items[i].Weight
-			if w < 0 {
-				return items[i].Item
-			}
-		}
-		panic("unreachable")
-	}
-}
-
-// Generate generates a sequence of n items, calling fn(rng)(rng) to produce
-// each item. It's intended to be used with a function returned by Weighted,
-// whhere the item itself is func(rng *rand.Rand).
-func Generate[I any](rng *rand.Rand, n int, fn func(*rand.Rand) func(*rand.Rand) I) []I {
+// Generate generates a sequence of n items, calling fn to produce
+// each item. It's intended to be used with a function returned by
+// (Weighted).Random or (Weighted).RandomDeck.
+func Generate[I any](n int, fn func() I) []I {
 	items := make([]I, n)
 	for i := 0; i < n; i++ {
-		items[i] = fn(rng)(rng)
+		items[i] = fn()
 	}
 	return items
 }
 
-// RunOne runs the provided operations, using the provided initial state.
-func RunOne[S any](t testing.TB, initial S, ops []Op[S]) {
+// NewLogger constructs a new logger for running randomized tests.
+func NewLogger(t testing.TB) *Logger {
 	l := &Logger{t: t}
-
 	// TODO(jackson): Support teeing to additional sink(s), eg, a file.
 	l.w = &l.history
 	l.wIndent = newlineIndentingWriter{Writer: l.w, indent: []byte("  ")}
+	return l
+}
 
+// Step runs the provided operation against the provided state.
+func Step[S any](l *Logger, s S, op Op[S]) {
 	// Ensure panics result in printing the history.
 	defer func() {
 		if r := recover(); r != nil {
@@ -81,20 +57,24 @@ func RunOne[S any](t testing.TB, initial S, ops []Op[S]) {
 		}
 	}()
 
+	// Set Logger's per-Op context.
+	l.logged = false
+	l.op = op
+	fmt.Fprintf(l, "op %6d: %s = ", l.opNumber, l.op)
+	op.Run(l, s)
+	if !l.logged {
+		fmt.Fprint(l, "-")
+	}
+	fmt.Fprintln(l)
+	l.opNumber++
+}
+
+// Run runs the provided operations, using the provided initial state.
+func Run[S any](t testing.TB, initial S, ops []Op[S]) {
+	l := NewLogger(t)
 	s := initial
 	for i := 0; i < len(ops); i++ {
-		// Set Logger's per-Op context.
-		l.opNumber = i
-		l.op = ops[i]
-		l.logged = false
-
-		fmt.Fprintf(l, "op %6d: %s = ", l.opNumber, l.op)
-		ops[i].Run(l, s)
-
-		if !l.logged {
-			fmt.Fprint(l, "-")
-		}
-		fmt.Fprintln(l)
+		Step[S](l, s, ops[i])
 	}
 	fmt.Fprintln(l, "done")
 	if t.Failed() {
